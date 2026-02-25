@@ -1,28 +1,31 @@
-# Connected Component Computation in MapReduce: Implementation and Experimental Analysis of the CCF Algorithm
+# Implementation and Analysis of CCF Algorithm in MapReduce
+
+### Big Data Project
+### David W. Fong, Dileep Kumar Malhi
 
 ---
 
-## 1. Description of the Adopted Solution
+## 1. Description of Solution
 
-### 1.1 Problem Statement
+### 1.1 Problem
 
 Finding connected components in a graph is a fundamental problem in graph theory with applications in social network analysis, record linkage, image segmentation, and data mining [1]. Given an undirected graph *G = (V, E)*, the objective is to partition *V* into disjoint sets *C = {C₁, C₂, ..., Cₙ}* such that for each component *Cᵢ*, there exists a path between any two vertices *vₖ, vₗ ∈ Cᵢ*, and no path exists between vertices in distinct components.
 
 As graph sizes have grown to billions of nodes and edges in domains such as social networks, web graphs, and entity resolution systems, sequential algorithms are no longer feasible. Distributed computing frameworks such as MapReduce and Apache Spark allow graph algorithms to scale across clusters of commodity machines.
 
-### 1.2 Adopted Approach
+### 1.2 Method
 
 We adopt the Connected Component Finder (CCF) algorithm proposed by Kardes et al. [1], which identifies connected components through iterative MapReduce jobs. The algorithm represents each component by the smallest node ID it contains. Through repeated iterations of two MapReduce jobs, CCF-Iterate and CCF-Dedup, minimum node IDs are propagated along edges until every node in a component maps to the same minimum ID.
 
 The algorithm takes as input an edge list and produces a mapping from each node to its component identifier (the smallest node ID in its component). The iterative process terminates when no new pairs are generated in a given iteration, as tracked by a global counter.
 
-### 1.3 Implementation Framework
+### 1.3 Implementation
 
 We implement the CCF algorithm using Apache Spark (PySpark 4.0.1 and Scala) with Resilient Distributed Datasets (RDDs) as the distributed data abstraction. RDDs provide immutability and fault tolerance through lineage-based recovery, lazy evaluation where transformations are deferred until an action (e.g., `count()`, `collect()`) triggers execution, and in-memory caching of intermediate results across iterations via `.cache()`.
 
 The MapReduce paradigm translates directly to the RDD API: the map phase corresponds to `flatMap` transformations, and the reduce phase corresponds to `groupByKey` followed by per-key aggregation. The iterative structure of CCF is implemented as a `while` loop that applies CCF-Iterate and CCF-Dedup until convergence.
 
-### 1.4 Relation to the Original Paper
+### 1.4 Comparison with Original Paper
 
 The original CCF paper [1] was implemented in Java using Hadoop MapReduce and demonstrated on a graph with ~6 billion nodes and ~92 billion edges on an 80-node Hadoop cluster. Our implementation preserves the algorithmic logic while adapting to the Spark RDD API. The differences from the Hadoop version are: (1) RDD-based data flow replaces HDFS file-based intermediate storage between iterations; (2) intermediate RDDs are cached in memory between iterations, reducing I/O overhead; (3) the NewPair counter is implemented via manual counting in the reduce function (Python) or a Spark `LongAccumulator` (Scala), rather than Hadoop's global counter mechanism; (4) CCF-Dedup uses Spark's `distinct()` (Python) or `reduceByKey` on composite keys (Scala), which is semantically equivalent to the paper's composite-key deduplication pattern.
 
@@ -36,9 +39,9 @@ The secondary sort variant (Section 2.2) in the paper uses Hadoop's secondary so
 
 The CCF module consists of two MapReduce jobs executed iteratively: CCF-Iterate, which propagates minimum node IDs along edges, and CCF-Dedup, which removes duplicate pairs between iterations. The process repeats until no new pairs are generated, tracked by a global counter `NewPair`. The output is a set of *(node, componentID)* pairs where `componentID` is the smallest node ID in the component.
 
-### 2.2 CCF-Iterate, Basic Version (Figure 2 of [1])
+### 2.2 CCF-Iterate, Basic Version 
 
-The basic CCF-Iterate constructs adjacency lists and propagates minimum IDs.
+The basic CCF-Iterate algorithm, shown in Figure 2 of [1], constructs adjacency lists and propagates minimum IDs.
 
 **Map Phase:**
 For each input pair *(key, value)*, emit both *(key, value)* and *(value, key)*. This ensures each node appears as a key with all its neighbours as values, effectively constructing a bidirectional adjacency list.
@@ -61,9 +64,9 @@ grouped = mapped.groupByKey()
 # reduce_fn iterates values twice: find min, then emit pairs
 ```
 
-### 2.3 CCF-Iterate, Secondary Sort Version (Figure 3 of [1])
+### 2.3 CCF-Iterate, Secondary Sort Version
 
-The secondary sort variant improves memory efficiency by delivering values to the reducer in sorted order, so the first value is guaranteed to be the minimum.
+The secondary sort variant, shown in Figure 3 of [1], improves memory efficiency by delivering values to the reducer in sorted order, so the first value is guaranteed to be the minimum.
 
 **Map Phase:** Identical to the basic version.
 
@@ -150,7 +153,7 @@ Both algorithm variants, Basic (Figure 2) and SecondarySort (Figure 3), were eva
 | 5,000 | 15,000 | Basic         |     6      |    6.58  |     1      |
 | 5,000 | 15,000 | SecondarySort |     6      |    6.78  |     1      |
 
-The iteration count is nearly constant at 5 to 6 regardless of graph size (50 to 5,000 nodes), consistent with the paper's observation that real-world graphs have small effective diameters [1, Section IV] and the small-world properties of random graphs [5]. Runtime increases modestly from 5.0s to 6.8s for a 100x increase in graph size, indicating that at this scale the fixed overhead of Spark job initialisation dominates per-iteration data processing. Both variants yield identical iteration counts, confirming that they implement the same convergence logic and differ only in reducer memory management. At edge density of approximately 3x the node count, all graphs form a single connected component, consistent with the Erdős-Rényi connectivity threshold.
+The iteration count is nearly constant at 5 to 6 regardless of graph size (50 to 5,000 nodes), consistent with the paper's observation that real-world graphs have small effective diameters [1, Section IV] and the small-world properties of random graphs [4]. Runtime increases modestly from 5.0s to 6.8s for a 100x increase in graph size, indicating that at this scale the fixed overhead of Spark job initialisation dominates per-iteration data processing. Both variants yield identical iteration counts, confirming that they implement the same convergence logic and differ only in reducer memory management. At edge density of approximately 3x the node count, all graphs form a single connected component, consistent with the Erdős-Rényi connectivity threshold.
 
 ### 3.3 Experiment 2: Chain Graphs (Worst-Case Diameter)
 
@@ -188,7 +191,7 @@ Iterations grow logarithmically with chain length: 6 iterations for n=10, 8 for 
 
 Isolated clusters converge in 6 to 7 iterations since each cluster has a small internal diameter and convergence proceeds independently within each component. Adding inter-cluster edges increases the iteration count (from 7 to 11 for 20 clusters) because merging clusters creates larger effective components with greater diameter. Component detection is correct across all configurations: with 0 inter-edges, detected components equal the cluster count, and adding bridges merges clusters as expected. Both algorithm variants perform comparably at this scale, with differences within the noise margin of local Spark execution.
 
-### 3.5 Comparison with Paper Results
+### 3.5 Comparison with Original Paper
 
 The original paper [1] reports results on the web-google dataset (875K nodes, 5.1M edges):
 
@@ -246,9 +249,7 @@ CCF is simple to implement and has proven scalability to billion-node graphs. It
 
 [3] U. Kang, C. Tsourakakis, and C. Faloutsos, "PEGASUS: mining peta-scale graphs," *Knowledge and Information Systems*, vol. 27, no. 2, pp. 303–325, 2011.
 
-[4] J. Lin and C. Dyer, *Data-Intensive Text Processing with MapReduce*, Morgan & Claypool Publishers, 2010.
-
-[5] P. Erdős and A. Rényi, "On the evolution of random graphs," *Publications of the Mathematical Institute of the Hungarian Academy of Sciences*, vol. 5, pp. 17–61, 1960.
+[4] P. Erdős and A. Rényi, "On the evolution of random graphs," *Publications of the Mathematical Institute of the Hungarian Academy of Sciences*, vol. 5, pp. 17–61, 1960.
 
 ---
 
@@ -388,7 +389,7 @@ if __name__ == "__main__":
     sc.stop()
 ```
 
-### A.2 Experiment Script (`ccf_experiments.py`)
+### A.2 Experiment Running Script (`ccf_experiments.py`)
 
 ```python
 """
