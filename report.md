@@ -41,7 +41,7 @@ The CCF module consists of two MapReduce jobs executed iteratively: CCF-Iterate,
 
 ### 2.2 CCF-Iterate, Basic Version 
 
-The basic CCF-Iterate algorithm, shown in Figure 2 of [1], constructs adjacency lists and propagates minimum IDs.
+The basic CCF-Iterate algorithm, whose implementation is shown in Figure 2 of [1], constructs adjacency lists and propagates minimum IDs.
 
 **Map Phase:**
 For each input pair *(key, value)*, emit both *(key, value)* and *(value, key)*. This ensures each node appears as a key with all its neighbours as values, effectively constructing a bidirectional adjacency list.
@@ -66,7 +66,7 @@ grouped = mapped.groupByKey()
 
 ### 2.3 CCF-Iterate, Secondary Sort Version
 
-The secondary sort variant, shown in Figure 3 of [1], improves memory efficiency by delivering values to the reducer in sorted order, so the first value is guaranteed to be the minimum.
+The secondary sort variant, whose implementation is shown in Figure 3 of [1], improves memory efficiency by delivering values to the reducer in sorted order, so the first value is guaranteed to be the minimum.
 
 **Map Phase:** Identical to the basic version.
 
@@ -85,9 +85,9 @@ grouped = mapped.groupByKey().mapValues(lambda vals: sorted(vals))
 # reduce_fn: first element of sorted list is minValue; single pass
 ```
 
-### 2.4 CCF-Dedup (Figure 4 of [1])
+### 2.4 CCF-Dedup
 
-CCF-Iterate may emit the same pair multiple times within a single iteration. CCF-Dedup removes these duplicates to reduce the input size for the next iteration.
+CCF-Iterate may emit the same pair multiple times within a single iteration. CCF-Dedup, whose implementation is shown in Figure 4 of [1], removes these duplicates to reduce the input size for the next iteration.
 
 **Map Phase:** For each pair *(key, value)*, create a composite key `temp = (key, value)` and emit *(temp, null)*.
 
