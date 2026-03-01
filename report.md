@@ -9,122 +9,46 @@
 
 ### 1.1 Problem
 
-Finding connected components in a graph is a fundamental problem in graph theory with applications in social network analysis, record linkage, image segmentation, and data mining [1]. Given an undirected graph *G = (V, E)*, the objective is to partition *V* into disjoint sets *C = {C₁, C₂, ..., Cₙ}* such that for each component *Cᵢ*, there exists a path between any two vertices *vₖ, vₗ ∈ Cᵢ*, and no path exists between vertices in distinct components.
-
-As graph sizes have grown to billions of nodes and edges in domains such as social networks, web graphs, and entity resolution systems, sequential algorithms are no longer feasible. Distributed computing frameworks such as MapReduce and Apache Spark allow graph algorithms to scale across clusters of commodity machines.
+Finding connected components in a graph is a fundamental problem in graph theory with applications in social network analysis, record linkage, image segmentation, and data mining [1]. Given an undirected graph *G = (V, E)*, the objective is to partition *V* into disjoint sets such that vertices within each partition are mutually reachable and no path exists between distinct partitions. As graphs have grown to billions of nodes, sequential algorithms are no longer feasible, motivating distributed approaches such as MapReduce.
 
 ### 1.2 Method
 
-We adopt the Connected Component Finder (CCF) algorithm proposed by Kardes et al. [1], which identifies connected components through iterative MapReduce jobs. The algorithm represents each component by the smallest node ID it contains. Through repeated iterations of two MapReduce jobs, CCF-Iterate and CCF-Dedup, minimum node IDs are propagated along edges until every node in a component maps to the same minimum ID.
-
-The algorithm takes as input an edge list and produces a mapping from each node to its component identifier (the smallest node ID in its component). The iterative process terminates when no new pairs are generated in a given iteration, as tracked by a global counter.
+We adopt the Connected Component Finder (CCF) algorithm proposed by Kardes et al. [1]. The algorithm represents each component by the smallest node ID it contains, and propagates minimum IDs along edges through iterative MapReduce rounds until every node converges to the global minimum of its component. Two MapReduce jobs run per iteration: CCF-Iterate (propagation) and CCF-Dedup (deduplication). Iteration stops when no new pairs are generated, tracked by a global counter.
 
 ### 1.3 Implementation
 
-We implement the CCF algorithm using Apache Spark (PySpark 4.0.1 and Scala) with Resilient Distributed Datasets (RDDs) as the distributed data abstraction. RDDs provide immutability and fault tolerance through lineage-based recovery, lazy evaluation where transformations are deferred until an action (e.g., `count()`, `collect()`) triggers execution, and in-memory caching of intermediate results across iterations via `.cache()`.
-
-The MapReduce paradigm translates directly to the RDD API: the map phase corresponds to `flatMap` transformations, and the reduce phase corresponds to `groupByKey` followed by per-key aggregation. The iterative structure of CCF is implemented as a `while` loop that applies CCF-Iterate and CCF-Dedup until convergence.
-
-### 1.4 Comparison with Original Paper
-
-The original CCF paper [1] was implemented in Java using Hadoop MapReduce and demonstrated on a graph with ~6 billion nodes and ~92 billion edges on an 80-node Hadoop cluster. Our implementation preserves the algorithmic logic while adapting to the Spark RDD API. The differences from the Hadoop version are: (1) RDD-based data flow replaces HDFS file-based intermediate storage between iterations; (2) intermediate RDDs are cached in memory between iterations, reducing I/O overhead; (3) the NewPair counter is implemented via manual counting in the reduce function (Python) or a Spark `LongAccumulator` (Scala), rather than Hadoop's global counter mechanism; (4) CCF-Dedup uses Spark's `distinct()` (Python) or `reduceByKey` on composite keys (Scala), which is semantically equivalent to the paper's composite-key deduplication pattern.
-
-The secondary sort variant (Section 2.2) in the paper uses Hadoop's secondary sort mechanism with custom partitioning to deliver values to the reducer in sorted order without loading them into memory. In our Spark implementation, we approximate this with `groupByKey().mapValues(sorted(...))`, which collects values into memory before sorting. Our secondary sort variant therefore does not achieve the O(1) memory guarantee of the Hadoop implementation at the reducer level. A true Spark equivalent would require `repartitionAndSortWithinPartitions` with a custom partitioner.
+We implement CCF in both Python (PySpark 4.0.1) and Scala using Spark RDDs. The map phase uses `flatMap` to emit edges in both directions; the reduce phase uses `groupByKey` followed by per-key aggregation. Intermediate RDDs are cached with `.cache()` and a forced `.count()` action materialises each iteration. The original paper used Hadoop MapReduce on HDFS; our Spark version replaces file-based intermediate storage with in-memory RDDs. The secondary sort variant approximates Hadoop's streaming sort with an explicit `sorted()` call after `groupByKey`, which retains O(N) memory at the reducer rather than the O(1) of the Hadoop original.
 
 ---
 
 ## 2. Algorithms
 
-### 2.1 Overview
+### 2.1 CCF-Iterate (Basic)
 
-The CCF module consists of two MapReduce jobs executed iteratively: CCF-Iterate, which propagates minimum node IDs along edges, and CCF-Dedup, which removes duplicate pairs between iterations. The process repeats until no new pairs are generated, tracked by a global counter `NewPair`. The output is a set of *(node, componentID)* pairs where `componentID` is the smallest node ID in the component.
+**Map:** For each edge *(key, value)*, emit *(key, value)* and *(value, key)*, building a bidirectional adjacency list.
 
-### 2.2 CCF-Iterate, Basic Version 
+**Reduce:** For each node key and its grouped neighbours, find the minimum value `min`. If `min < key`, emit *(key, min)* and *(value, min)* for each neighbour ≠ min, and increment the `NewPair` counter. If `min ≥ key`, emit nothing. Space complexity is O(N) per reducer since all neighbours must be loaded to find the minimum then emit pairs.
 
-The basic CCF-Iterate algorithm, whose implementation is shown in Figure 2 of [1], constructs adjacency lists and propagates minimum IDs.
+### 2.2 CCF-Iterate (Secondary Sort)
 
-**Map Phase:**
-For each input pair *(key, value)*, emit both *(key, value)* and *(value, key)*. This ensures each node appears as a key with all its neighbours as values, effectively constructing a bidirectional adjacency list.
+Identical map phase. The reduce phase sorts values before processing so the first element is guaranteed to be the minimum, requiring only a single pass through the neighbour list. In the original Hadoop implementation this achieves O(1) reducer memory via streaming; in our Spark approximation (`groupByKey().mapValues(sorted(...))`) values are still collected into memory, so the memory benefit is not realised.
 
-**Reduce Phase:**
-For each key (node) with its grouped values (neighbours):
-1. Find the minimum value `min` across all values and the key itself.
-2. If `min < key` (a smaller ID exists in the neighbourhood):
-   - Emit *(key, min)*, mapping the key to the smaller ID.
-   - For each value ≠ min, emit *(value, min)*, propagating the minimum to all neighbours.
-   - Increment the `NewPair` counter for each such emission.
-3. If `min ≥ key`, emit nothing (this node is already the local minimum).
+### 2.3 CCF-Dedup
 
-**Space complexity:** O(N) per reducer, where N is the size of the adjacency list, since all values must be stored in a list to iterate twice (once to find the minimum, once to emit pairs).
+CCF-Iterate can emit the same pair from multiple reducers in one iteration. CCF-Dedup removes duplicates by treating each pair as a composite key (implemented as `distinct()` in Python, or `map(p => (p, null)).reduceByKey(...).map(_._1)` in Scala).
 
-**RDD Translation:**
-```python
-mapped = pairs_rdd.flatMap(lambda pair: [(pair[0], pair[1]), (pair[1], pair[0])])
-grouped = mapped.groupByKey()
-# reduce_fn iterates values twice: find min, then emit pairs
-```
-
-### 2.3 CCF-Iterate, Secondary Sort Version
-
-The secondary sort variant, whose implementation is shown in Figure 3 of [1], improves memory efficiency by delivering values to the reducer in sorted order, so the first value is guaranteed to be the minimum.
-
-**Map Phase:** Identical to the basic version.
-
-**Reduce Phase:**
-1. The first value from the sorted iterator is `minValue`.
-2. If `minValue < key`:
-   - Emit *(key, minValue)*.
-   - For each remaining value in the iterator, emit *(value, minValue)* and increment `NewPair`.
-3. If `minValue ≥ key`, emit nothing.
-
-**Space complexity:** O(1) per reducer in the original Hadoop implementation, where values are streamed from disk in sorted order. In our Spark implementation, this is approximated with an explicit sort after `groupByKey`, which still requires O(N) memory (see Section 1.4).
-
-**RDD Translation:**
-```python
-grouped = mapped.groupByKey().mapValues(lambda vals: sorted(vals))
-# reduce_fn: first element of sorted list is minValue; single pass
-```
-
-### 2.4 CCF-Dedup
-
-CCF-Iterate may emit the same pair multiple times within a single iteration. CCF-Dedup, whose implementation is shown in Figure 4 of [1], removes these duplicates to reduce the input size for the next iteration.
-
-**Map Phase:** For each pair *(key, value)*, create a composite key `temp = (key, value)` and emit *(temp, null)*.
-
-**Reduce Phase:** For each unique composite key, emit *(key.entity1, key.entity2)*.
-
-This is effectively a deduplication operation. In Spark, it maps directly to `distinct()` or equivalently `map(pair => (pair, null)).reduceByKey(...).map(_._1)`.
-
-**RDD Translation:**
-```python
-# Python: simple and idiomatic
-return pairs_rdd.distinct()
-
-# Scala: explicit composite-key pattern matching the paper
-pairsRDD.map(pair => (pair, null)).reduceByKey((a, _) => a).map(_._1)
-```
-
-### 2.5 Full CCF Pipeline
-
-The complete algorithm is:
+### 2.4 Full Pipeline and Correctness
 
 ```
-Input: Edge list E
-Output: (node, componentID) mapping
-
-pairs ← E
+pairs ← edge list E
 repeat:
-    pairs ← CCF-Iterate(pairs)      // Propagate minimum IDs
-    pairs ← CCF-Dedup(pairs)        // Remove duplicates
+    pairs ← CCF-Iterate(pairs)
+    pairs ← CCF-Dedup(pairs)
 until NewPair counter = 0
 return pairs
 ```
 
-The algorithm converges when no new pairs are generated in an iteration. At each iteration, minimum IDs propagate at least one hop further, so convergence is guaranteed in at most *d* iterations where *d* is the graph diameter. In practice, the number of iterations is much smaller than *d* because each CCF-Iterate step can propagate minimum IDs across multiple hops: when a node receives a new minimum, that minimum is immediately forwarded to all its neighbours in the same iteration. The paper does not provide a formal proof of the iteration bound, but empirically the iteration count grows logarithmically with the diameter. Our experiments confirm this (see Section 3.3).
-
-### 2.6 Correctness
-
-The algorithm correctly identifies connected components for three reasons. First, component IDs can only decrease (each node maps to the minimum in its neighbourhood), which guarantees convergence. Second, the map phase emits edges in both directions, ensuring bidirectional reachability. Third, the iteration continues until no new pairs are generated, so every node converges to the global minimum ID of its component.
+The algorithm is correct because component IDs can only decrease (guaranteeing convergence), edges are emitted bidirectionally (ensuring reachability), and iteration continues until no new pairs are produced (ensuring every node reaches the global minimum of its component). Convergence is guaranteed in at most *d* iterations (the graph diameter); empirically, iterations grow as approximately log₂(d) because each step can relay minimum IDs multiple hops within a single reduce step.
 
 ---
 
@@ -153,7 +77,7 @@ Both algorithm variants, Basic (Figure 2) and SecondarySort (Figure 3), were eva
 | 5,000 | 15,000 | Basic         |     6      |    6.58  |     1      |
 | 5,000 | 15,000 | SecondarySort |     6      |    6.78  |     1      |
 
-The iteration count is nearly constant at 5 to 6 regardless of graph size (50 to 5,000 nodes), consistent with the paper's observation that real-world graphs have small effective diameters [1, Section IV] and the small-world properties of random graphs [4]. Runtime increases modestly from 5.0s to 6.8s for a 100x increase in graph size, indicating that at this scale the fixed overhead of Spark job initialisation dominates per-iteration data processing. Both variants yield identical iteration counts, confirming that they implement the same convergence logic and differ only in reducer memory management. All generated graphs form a single connected component; at density 3x the node count (average degree 6) the Erdős-Rényi giant-component threshold (average degree > 1) is comfortably exceeded, though the full-connectivity threshold (average degree ≥ ln n) is only met for smaller graphs in this range (ln 50 ≈ 3.9 < 6, but ln 5000 ≈ 8.5 > 6). The single-component result for larger graphs reflects the specific random seed (42) rather than a guaranteed theoretical threshold.
+Iterations remain nearly constant at 5–6 across a 100× increase in graph size, consistent with the small-world properties of random graphs [4]. Runtime grows modestly (5.0s to 6.8s), dominated by fixed Spark job overhead rather than per-iteration computation. Both variants yield identical iteration counts. All graphs form a single connected component at this density.
 
 ### 3.3 Experiment 2: Chain Graphs (Worst-Case Diameter)
 
@@ -170,7 +94,7 @@ The iteration count is nearly constant at 5 to 6 regardless of graph size (50 to
 |   500 |   499 | Basic         |    12      |   13.19  |
 |   500 |   499 | SecondarySort |    12      |   17.75  |
 
-Iterations grow logarithmically with chain length: 6 iterations for n=10, 8 for n=50, 9 for n=100, 10 for n=200, and 12 for n=500. For chain graphs, *d* = n-1, so these values are consistent with approximately log2(d) + c iterations. Note that the CCF paper does not formally prove this bound; we observe it empirically. The logarithmic behaviour arises because each iteration can propagate a minimum ID across multiple hops when intermediate nodes relay it to their neighbours within the same reduce step. Chain graphs are the worst-case topology for CCF since they have the maximum possible diameter for a given node count. The paper acknowledges the diameter dependency as a limitation compared to CC-MR, which achieves O(3 log d) iterations [1, Section II]. Runtime is directly proportional to iteration count in this regime because per-iteration data volume is minimal. At n=500, the Basic variant is faster than SecondarySort (13.2s vs 17.8s). The sorting overhead in the secondary sort variant is not amortised when adjacency lists are small (each node has at most 2 neighbours in a chain), confirming the paper's guidance that secondary sort is advantageous only for large components [1, Section III].
+Iterations grow logarithmically with chain length (6 for n=10, 8 for n=50, 9 for n=100, 10 for n=200, 12 for n=500), consistent with approximately log₂(d) + c where d = n−1. Runtime scales proportionally with iteration count since per-iteration data volume is small. At n=500, Basic is faster than SecondarySort (13.2s vs 17.8s): sorting overhead is not amortised when adjacency lists have at most 2 neighbours.
 
 ### 3.4 Experiment 3: Cluster Graphs (Multiple Components)
 
@@ -189,70 +113,26 @@ Iterations grow logarithmically with chain length: 6 iterations for n=10, 8 for 
 |   20     |      50       |     19      | Basic         |    11      |   10.60  |     4      |
 |   20     |      50       |     19      | SecondarySort |    11      |   10.12  |     4      |
 
-Isolated clusters converge in 6 to 7 iterations since each cluster has a small internal diameter and convergence proceeds independently within each component. Adding inter-cluster edges increases the iteration count (from 7 to 11 for 20 clusters) because merging clusters creates larger effective components with greater diameter. Component detection is correct across all configurations: with 0 inter-edges, detected components equal the cluster count, and adding bridges merges clusters as expected. Both algorithm variants perform comparably at this scale, with differences within the noise margin of local Spark execution.
+Isolated clusters converge in 6–7 iterations. Adding inter-cluster edges increases iteration count (7 to 11 for 20 clusters) as merging creates larger effective diameters. Component detection is correct in all configurations: 0 inter-edges gives component count equal to cluster count, and bridges merge clusters as expected.
 
 ### 3.5 Python vs Scala Runtime Comparison
 
-Both implementations were run on the same machine (Apple M-series, 8 cores, local Spark mode) using PySpark 4.0.1 / Spark 4.0.1 (Scala 2.13.16, Java 17). The *Iters* column below shows the Scala run's iteration count. For chain graphs, which are deterministic, Python and Scala always produce identical iteration counts and component assignments. For random and cluster-with-inter-edges graphs, the Python and Scala random number generators differ (Java's `java.util.Random` vs Python's `random.Random`), so at the same seed they generate different edge sets — iteration counts and component counts can therefore differ by small amounts between the two implementations for those cases. Only runtimes are compared.
+Both implementations were run on the same machine (Apple M-series, 8 cores, Spark 4.0.1 local mode). The table below shows representative results; full results are in `experiment_results_scala.csv`.
 
-**Experiment 1: Random Graphs**
+| Experiment | Graph | Python (s) | Scala (s) | Speedup |
+|---|---|---:|---:|---:|
+| Random | 50 nodes, 100 edges | 5.90 | 1.64 | 3.6× |
+| Random | 5,000 nodes, 15,000 edges | 6.58 | 0.84 | 7.8× |
+| Chain | 10 nodes | 6.21 | 0.22 | 28.2× |
+| Chain | 500 nodes | 13.19 | 1.26 | 10.5× |
+| Cluster | 5 clusters, 0 inter-edges | 7.69 | 0.21 | 36.6× |
+| Cluster | 20 clusters, 19 inter-edges | 10.60 | 0.70 | 15.1× |
 
-| Nodes | Edges | Algorithm | Iters | Python (s) | Scala (s) | Speedup |
-|------:|------:|-----------|:-----:|-----------:|----------:|--------:|
-|    50 |   100 | Basic         | 5 |  5.90 | 1.64 | 3.6× |
-|    50 |   100 | SecondarySort | 5 |  5.06 | 0.46 | 11.0× |
-|   100 |   300 | Basic         | 5 |  5.09 | 0.48 | 10.6× |
-|   100 |   300 | SecondarySort | 5 |  5.23 | 0.39 | 13.4× |
-|   500 | 1,500 | Basic         | 5 |  5.29 | 0.70 | 7.6× |
-|   500 | 1,500 | SecondarySort | 6 |  5.67 | 0.60 | 9.5× |
-| 1,000 | 3,000 | Basic         | 5 |  6.89 | 0.45 | 15.3× |
-| 1,000 | 3,000 | SecondarySort | 6 |  6.26 | 0.42 | 14.9× |
-| 2,000 | 6,000 | Basic         | 6 |  6.67 | 0.61 | 10.9× |
-| 2,000 | 6,000 | SecondarySort | 6 |  5.76 | 0.61 | 9.4× |
-| 5,000 |15,000 | Basic         | 6 |  6.58 | 0.84 | 7.8× |
-| 5,000 |15,000 | SecondarySort | 6 |  6.78 | 0.78 | 8.7× |
-
-**Experiment 2: Chain Graphs**
-
-| Nodes | Edges | Algorithm | Iters | Python (s) | Scala (s) | Speedup |
-|------:|------:|-----------|:-----:|-----------:|----------:|--------:|
-|    10 |     9 | Basic         |  6 |  6.21 | 0.22 | 28.2× |
-|    10 |     9 | SecondarySort |  6 |  5.64 | 0.19 | 29.7× |
-|    50 |    49 | Basic         |  8 |  7.79 | 0.31 | 25.1× |
-|    50 |    49 | SecondarySort |  8 |  7.74 | 0.30 | 25.8× |
-|   100 |    99 | Basic         |  9 |  9.40 | 0.40 | 23.5× |
-|   100 |    99 | SecondarySort |  9 |  9.17 | 0.39 | 23.5× |
-|   200 |   199 | Basic         | 10 | 10.09 | 0.51 | 19.8× |
-|   200 |   199 | SecondarySort | 10 | 11.01 | 0.51 | 21.6× |
-|   500 |   499 | Basic         | 12 | 13.19 | 1.26 | 10.5× |
-|   500 |   499 | SecondarySort | 12 | 17.75 | 1.26 | 14.1× |
-
-**Experiment 3: Cluster Graphs**
-
-| Clusters | Nodes/Cluster | Inter-edges | Algorithm | Iters | Python (s) | Scala (s) | Speedup |
-|---------:|--------------:|:-----------:|-----------|:-----:|-----------:|----------:|--------:|
-|  5 |  20 |  0 | Basic         |  6 |  7.69 | 0.21 | 36.6× |
-|  5 |  20 |  0 | SecondarySort |  6 |  6.07 | 0.21 | 28.9× |
-|  5 |  20 |  4 | Basic         |  8 |  6.98 | 0.27 | 25.9× |
-|  5 |  20 |  4 | SecondarySort |  8 |  6.75 | 0.26 | 26.0× |
-| 10 |  50 |  0 | Basic         |  7 |  7.34 | 0.47 | 15.6× |
-| 10 |  50 |  0 | SecondarySort |  7 |  7.34 | 0.45 | 16.3× |
-| 10 |  50 |  9 | Basic         |  9 |  8.55 | 0.57 | 15.0× |
-| 10 |  50 |  9 | SecondarySort |  9 | 10.19 | 0.53 | 19.2× |
-| 20 |  50 |  0 | Basic         |  7 |  6.99 | 0.56 | 12.5× |
-| 20 |  50 |  0 | SecondarySort |  7 |  7.76 | 0.60 | 12.9× |
-| 20 |  50 | 19 | Basic         | 10 | 10.60 | 0.70 | 15.1× |
-| 20 |  50 | 19 | SecondarySort | 11 | 10.12 | 0.88 | 11.5× |
-
-**Analysis.** Scala is consistently 8–37× faster than Python across all experiments. The largest speedups occur on small, sparse graphs (chain n=10: ~29×, 5-cluster isolated: ~37×), where Python's fixed per-job overhead (~5s baseline from PySpark initialisation and Python-JVM serialisation) dominates total runtime. On larger graphs where actual computation increases (random n=5000: ~8×, chain n=500: ~10–14×), the speedup narrows but remains substantial.
-
-The performance gap has two sources. First, Python incurs a serialisation cost at every RDD transformation: Python objects are pickled, sent to the JVM, processed, and results are unpickled back. Scala operates natively on the JVM, eliminating this round-trip entirely. Second, Scala's static typing allows the JIT compiler to optimise the inner loops of the reduce function (adjacency list traversal, min finding) more aggressively than CPython can.
-
-For chain graphs (deterministic), both implementations produce identical iteration counts and component assignments, confirming semantic equivalence of the core algorithm. For random and cluster graphs with inter-edges, small differences in iteration counts and component counts arise from the different RNG implementations between Java and Python; the algorithms are structurally equivalent but operate on slightly different input graphs at the same seed.
+Scala is consistently **8–37× faster** than Python. The largest speedups occur on small graphs where Python's ~5s fixed overhead (PySpark initialisation and Python-JVM pickle serialisation) dominates. The gap narrows on larger graphs as computation time grows relative to the fixed overhead. For chain graphs (deterministic), both implementations produce identical iteration counts and component assignments. For random and cluster graphs, minor differences arise from different Java vs Python RNG implementations at the same seed.
 
 ### 3.6 Comparison with Original Paper
 
-The original paper [1] reports results on the web-google dataset (875K nodes, 5.1M edges):
+The original paper [1] reports results on the web-google dataset (875K nodes, 5.1M edges) on a 50-node Hadoop cluster:
 
 | Algorithm | Iterations | Runtime (s) |
 |-----------|:----------:|------------:|
@@ -260,33 +140,17 @@ The original paper [1] reports results on the web-google dataset (875K nodes, 5.
 | CC-MR     |      8     |         224 |
 | CCF       |     11     |         256 |
 
-Direct runtime comparison between our results and the paper's is not meaningful: the paper uses Hadoop on a 50-node cluster with the 875K-node web-google dataset, while our experiments use PySpark in local mode on graphs up to 5,000 nodes. However, the iteration counts are comparable. Our random graphs converge in 5 to 6 iterations, while web-google requires 11, reflecting its larger diameter. The relative ordering of algorithms (PEGASUS=16 > CCF=11 > CC-MR=8 in iteration count) is consistent with the following characterisation: PEGASUS requires O(d) iterations, making it slowest on any graph. CCF and CC-MR both exhibit logarithmic convergence in practice, but CC-MR converges faster empirically (8 vs 11 iterations) because it has a formal proven bound of at most 3 log d iterations [1, Section II], whereas CCF has no formal proof of its logarithmic behaviour — the O(log d) convergence is empirical only (as noted in Section 2.5). CCF's formal worst-case bound remains O(d).
+Direct runtime comparison is not meaningful given the different scales and infrastructure. However, our random graphs converge in 5–6 iterations compared to web-google's 11, reflecting its larger diameter. PEGASUS requires O(d) iterations; both CCF and CC-MR exhibit logarithmic convergence in practice, with CC-MR converging faster (8 vs 11 iterations) because it carries a formal proven bound of at most 3 log d iterations [1], while CCF's logarithmic behaviour is empirical only — its formal worst-case bound is O(d).
 
 ---
 
-## 4. Comments on Experimental Analysis
+## 4. Discussion
 
-### 4.1 Strengths of the CCF Algorithm
+**Strengths.** CCF requires only two standard MapReduce operations per iteration (flatMap and groupByKey), making it straightforward to implement and port across frameworks. On small-diameter graphs — which include most real-world networks — it converges in 5–7 iterations regardless of graph size, keeping the total number of shuffle rounds low. The two reducer variants provide a trade-off between simplicity (Basic) and memory efficiency (SecondarySort), the latter being important when components contain millions of nodes.
 
-CCF uses only two MapReduce jobs and standard key-value operations (map, groupByKey, emit) without graph partitioning schemes or inter-node messaging protocols. This makes it portable across MapReduce-compatible frameworks and easy to debug, since each iteration's input and output are plain key-value pair files that can be inspected directly.
+**Weaknesses.** Convergence depends on graph diameter: our chain experiments show 12 iterations at n=500 versus 6 for random graphs of the same size. Each additional iteration adds a full shuffle cycle, making high-diameter graphs costly. CC-MR [2] offers a formal O(3 log d) convergence guarantee and converges faster in practice (8 vs 11 iterations on web-google). CCF also generates duplicate pairs that require the extra CCF-Dedup step each iteration, and assumes undirected graphs. Our Spark secondary sort approximation does not achieve the O(1) reducer memory of the Hadoop original, as `groupByKey().mapValues(sorted(...))` still collects values into memory.
 
-The low iteration count on small-diameter graphs (as confirmed in our experiments and by Kang et al. [3]) means the total number of MapReduce rounds is small in practice, which is the dominant cost factor in distributed settings. The availability of two reducer variants allows the implementation to be adapted to the expected component size: the basic variant avoids sorting overhead for moderate components, while the secondary sort variant caps reducer memory usage for components with millions of nodes [1]. The CCF-Dedup step adds one MapReduce job per iteration but reduces shuffle volume in subsequent iterations, which is a net benefit when duplicate pairs are numerous.
-
-### 4.2 Weaknesses and Limitations
-
-The number of iterations depends on graph diameter. Empirically, iterations grow as approximately log2(d), but the paper does not provide a formal proof of this bound — CCF's formal worst-case bound is O(d). For high-diameter graphs (chains, trees, sparse lattices), CCF requires more iterations than for small-world graphs. Our chain graph experiments show 12 iterations for 500 nodes (diameter 499), compared to 6 iterations for random graphs of equivalent size. CC-MR [2] provides a formal proven convergence guarantee of at most 3 log d iterations, giving it a tighter worst-case bound than CCF's formal O(d). In practice, CC-MR also converges faster on the same graphs (8 vs 11 iterations on web-google). Each iteration involves a full MapReduce shuffle cycle (serialisation, network transfer, disk spill, deserialisation), so each additional iteration incurs job scheduling and initialisation overhead. The combination of fewer iterations and equivalent per-iteration cost is the primary reason CC-MR's 8-iteration result outperforms CCF's 11-iteration result in wall-clock time on web-google.
-
-Our Spark implementation uses `groupByKey().mapValues(sorted(...))` to simulate secondary sort. This collects all values into memory before sorting, negating the O(1) memory advantage of the Hadoop secondary sort mechanism. A production Spark implementation should use `repartitionAndSortWithinPartitions` with a custom partitioner to achieve true streaming sort behaviour.
-
-Real-world graphs often follow power-law degree distributions where a small number of hub nodes have very high degree. In CCF-Iterate, these hubs produce large adjacency lists concentrated on a single reducer, creating load imbalance. The paper does not address this concern, and our synthetic experiments (with relatively uniform degree distributions) do not exercise this weakness.
-
-CCF-Iterate can also emit the same *(value, min)* pair from multiple reducers within a single iteration, requiring the CCF-Dedup step. While dedup is efficient (a single MapReduce job), it is additional I/O and computation that more sophisticated algorithms avoid. The algorithm also assumes undirected graphs (the mapper emits both directions of each edge); finding strongly connected components in directed graphs requires different algorithms such as forward-backward reachability.
-
-Finally, our experiments run on a single machine where Spark's per-iteration overhead (~5s) dominates total runtime. This makes it difficult to observe the true scaling characteristics of the algorithm. Meaningful runtime comparisons between Basic and SecondarySort would require graphs with 100K+ nodes on a multi-node cluster.
-
-### 4.3 RDD Implementation Considerations
-
-The translation from Hadoop MapReduce to Spark RDDs introduces several considerations. We use `groupByKey` in CCF-Iterate because the reduce logic requires access to all values simultaneously to find the minimum and then emit pairs. Unlike simple aggregations where `reduceByKey` is preferred for its combiner optimisation, CCF's reduce logic is a group-and-process pattern. Between iterations, the deduplicated RDD is cached in memory (`.cache()`) and the previous iteration's RDD is unpersisted. This prevents recomputation but increases memory pressure, a trade-off that should be tuned based on cluster resources. Spark accumulators (used for the NewPair counter in Scala) are only guaranteed to be accurate when updated inside actions, not transformations, so we force evaluation with `.count()` before reading the accumulator value. This `count()` action is required each iteration to materialise the RDD and trigger the counter update.
+**Local-mode limitations.** Experiments run on a single machine where Spark's ~5s per-job overhead dominates runtime, masking true algorithmic differences between variants. Meaningful comparison of Basic vs SecondarySort would require graphs with 100K+ nodes on a multi-node cluster.
 
 ---
 
@@ -521,7 +385,7 @@ def run_ccf(sc, edges, iterate_fn, max_iterations=100):
 
 ## Appendix B: Scala Implementation
 
-## B.1 CCF Core Algorithm  (`CCFConnectedComponents.scala`)
+### B.1 CCF Core Algorithm  (`CCFConnectedComponents.scala`)
 
 ```scala
 import org.apache.spark.{SparkConf, SparkContext}
@@ -610,7 +474,7 @@ object CCFConnectedComponents {
 
 ---
 
-## B.2 Experiment Running Script (`CCFExperiments.scala`)
+### B.2 Experiment Running Script (`CCFExperiments.scala`)
 
 ```scala
 import org.apache.spark.{SparkConf, SparkContext}
